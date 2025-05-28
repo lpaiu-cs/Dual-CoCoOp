@@ -31,6 +31,8 @@ dtd/
 |–– images/
 |–– imdb/
 |–– labels/
+|–– classes.txt
+|–– eurosat_captions.json
 |–– split_zhou_DescribableTextures.json
 ```
 
@@ -43,6 +45,8 @@ The directory structure should look like
 ```
 eurosat/
 |–– 2750/
+|–– classes.txt
+|–– eurosat_captions.json
 |–– split_zhou_EuroSAT.json
 ```
 
@@ -53,8 +57,10 @@ eurosat/
 
 The directory structure should look like
 ```
-fgvc_aircraft/
+fgvc-aircraft-2013b/data
 |–– images/
+|–– fgvc_aircraft_captions.json
+|–– variants.txt
 |–– ... # a bunch of .txt files
 ```
 
@@ -66,9 +72,9 @@ The directory structure should look like
 ```
 food-101/
 |–– images/
-|–– license_agreement.txt
 |–– meta/
-|–– README.txt
+|–– license_agreement.txt
+|–– food101_captions.json
 |–– split_zhou_Food101.json
 ```
 
@@ -81,5 +87,7 @@ The directory structure should look like
 ```
 ucf101/
 |–– UCF-101-midframes/
+|–– classes.txt
 |–– split_zhou_UCF101.json
+|–– ucf101_captions.json
 ```
