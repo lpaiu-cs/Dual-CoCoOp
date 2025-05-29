@@ -27,8 +27,9 @@ import datasets.imagenet_r
 import trainers.zsclip
 import trainers.coop
 import trainers.cocoop
-import trainers.duop # custom trainer
 import trainers.licocoop # custom trainer
+import trainers.licocoop2 # custom trainer
+import trainers.ducocoop # custom trainer
 
 
 def print_args(args, cfg):
@@ -102,18 +103,24 @@ def extend_cfg(cfg):
     cfg.TRAINER.COCOOP.CTX_INIT = ""  # initialization words
     cfg.TRAINER.COCOOP.PREC = "fp16"  # fp16, fp32, amp
 
-    ##### DUOP Custom Code #####
-    cfg.TRAINER.DUOP = CN()
-    cfg.TRAINER.DUOP.N_CTX = 16  # number of context vectors
-    cfg.TRAINER.DUOP.CTX_INIT = ""  # initialization words
-    cfg.TRAINER.DUOP.PREC = "fp16"  # fp16, fp32, amp
-    # cfg.TRAINER.DUOP.CLASS_TOKEN_POSITION = "end"  # 'middle' or 'end' or 'front'
-
+    ##### Custom Code #####
     cfg.TRAINER.LICOCOOP = CN()
-    # cfg.TRAINER.LICOCOOP.N_CTX = 4  # number of context vectors
-    # cfg.TRAINER.LICOCOOP.CTX_INIT = ""  # initialization words
+    cfg.TRAINER.LICOCOOP.N_CTX = 16  # number of context vectors
+    cfg.TRAINER.LICOCOOP.CTX_INIT = ""  # initialization words
     cfg.TRAINER.LICOCOOP.PREC = "fp16"  # fp16, fp32, amp
-    ##### DUOP Custom Code #####
+    # cfg.TRAINER.LICOCOOP.CLASS_TOKEN_POSITION = "end"  # 'middle' or 'end' or 'front'
+
+    cfg.TRAINER.LICOCOOP2 = CN()
+    # cfg.TRAINER.LICOCOOP2.N_CTX = 4  # number of context vectors
+    # cfg.TRAINER.LICOCOOP2.CTX_INIT = ""  # initialization words
+    cfg.TRAINER.LICOCOOP2.PREC = "fp16"  # fp16, fp32, amp
+
+    cfg.TRAINER.DUCOCOOP = CN()
+    cfg.TRAINER.DUCOCOOP.N_CTX = 16  # number of context vectors
+    cfg.TRAINER.DUCOCOOP.CTX_INIT = ""  # initialization words
+    cfg.TRAINER.DUCOCOOP.PREC = "fp16"  # fp16, fp32, amp
+
+    ##### Custom Code #####
 
     cfg.DATASET.SUBSAMPLE_CLASSES = "all"  # all, base or new
 
