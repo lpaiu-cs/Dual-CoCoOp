@@ -50,11 +50,11 @@ class TextEncoder(nn.Module):
         x = x.permute(1, 0, 2)  # NLD -> LND
         x = self.transformer(x)
         x = x.permute(1, 0, 2)  # LND -> NLD
-        x = self.ln_final(x).type(self.dtype)
+        x = self.ln_final(x).type(self.dtype) # (batch, seq_len, dim)
 
-        # x.shape = [batch_size, n_ctx, transformer.width]
-        # take features from the eot embedding (eot_token is the highest number in each sequence)
-        x = x[torch.arange(x.shape[0]), tokenized_prompts.argmax(dim=-1)] @ self.text_projection
+        # 요약 토큰에 해당하는 마지막 EOT 임베딩만 추출 후 텍스트 이미지 공통 차원(512)으로 매핑한다.
+        # (batch, dim) @ W -> (batch, proj_dim)
+        x = x[torch.arange(x.shape[0]), tokenized_prompts.argmax(dim=-1)] @ self.text_projection 
 
         return x
     
@@ -98,16 +98,16 @@ class PromptLearner(nn.Module):
         super().__init__()
         self.device = device
         self.n_cls = len(classnames)
-        self.n_ctx = cfg.TRAINER.LICOCOOP.N_CTX
-        ctx_init = cfg.TRAINER.LICOCOOP.CTX_INIT
+        self.n_ctx = cfg.TRAINER.DUCOCOOP.N_CTX
+        ctx_init = cfg.TRAINER.DUCOCOOP.CTX_INIT
         self.dtype = clip_model.dtype
         ctx_dim = clip_model.ln_final.weight.shape[0]
-        # vis_dim = clip_model.visual.output_dim
+        vis_dim = clip_model.visual.output_dim
 
         self.captions = captions
         self.caption_gen = CaptionVecGen(device)
         bert_dim = self.caption_gen.bert.config.hidden_size # bert_dim: (768,) 동적으로 가져오기.
-        self.pi_bert = None  # (n_cls, bert_dim)
+        self.lpi_bert = None  # (n_cls, bert_dim)
 
         clip_imsize = clip_model.visual.input_resolution
         cfg_imsize = cfg.INPUT.SIZE[0]
@@ -130,16 +130,26 @@ class PromptLearner(nn.Module):
 
         self.ctx = nn.Parameter(ctx_vectors)
 
-        # meta_net2: (bert_dim → ctx_dim) 변환기
-        self.meta_net2 = nn.Sequential(OrderedDict([
+        # vi_meta_net
+        self.vi_meta_net = nn.Sequential(OrderedDict([
+            ("linear1", nn.Linear(vis_dim, vis_dim // 16)), # 512 → 32
+            ("relu", nn.ReLU(inplace=True)),
+            ("linear2", nn.Linear(vis_dim // 16, ctx_dim))
+        ]))
+
+        # li_meta_net: (bert_dim → ctx_dim) 변환기
+        self.li_meta_net = nn.Sequential(OrderedDict([
             ("linear1", nn.Linear(bert_dim, ctx_dim // 16)),
             ("relu", nn.ReLU(inplace=True)),
             ("linear2", nn.Linear(ctx_dim // 16, ctx_dim))
         ]))
+        
+        self. gate_layer = nn.Linear(ctx_dim * 2, ctx_dim).half()
 
-        if cfg.TRAINER.LICOCOOP.PREC == "fp16":
+        if cfg.TRAINER.DUCOCOOP.PREC == "fp16":
             # self.caption_gen.half()
-            self.meta_net2.half()
+            self.vi_meta_net.half()
+            self.li_meta_net.half()
 
         classnames = [name.replace("_", " ") for name in classnames]
         name_lens = [len(_tokenizer.encode(name)) for name in classnames]
@@ -156,31 +166,59 @@ class PromptLearner(nn.Module):
 
         self.tokenized_prompts = tokenized_prompts
         self.name_lens = name_lens
-        # self.class_token_position = cfg.TRAINER.LICOCOOP.PI_TOKEN_POSITION # 'on_ctx', 'off_ctx'
+        # self.class_token_position = cfg.TRAINER.DUCOCOOP.PI_TOKEN_POSITION # 'on_ctx', 'off_ctx'
 
-    def forward(self): # cap_vectors: (n_cls, bert_dim)
-        assert self.pi_bert is not None, "BERT embeddings must be generated before calling forward()"
+    def construct_prompts(self, ctx, prefix, suffix, label=None):
+        # dim0 is either batch_size (during training) or n_cls (during testing)
+        # ctx: context tokens, with shape of (dim0, n_ctx, ctx_dim)
+        # prefix: the sos token, with shape of (n_cls, 1, ctx_dim)
+        # suffix: remaining tokens, with shape of (n_cls, *, ctx_dim)
+
+        if label is not None:
+            prefix = prefix[label]
+            suffix = suffix[label]
+
+        prompts = torch.cat(
+            [
+                prefix,  # (dim0, 1, dim)
+                ctx,     # (dim0, n_ctx, dim)
+                suffix,  # (dim0, *, dim)
+            ],
+            dim=1,
+        )
+
+        return prompts
+    
+    def forward(self, im_features): # im_features: (batch, vis_dim)
+        assert self.lpi_bert is not None, "BERT embeddings must be generated before calling forward()"
         ctx = self.ctx # (n_ctx, ctx_dim)
-        ctx = ctx.unsqueeze(0).expand(self.n_cls, -1, -1) # (n_cls, n_ctx, ctx_dim)
-        pi = self.meta_net2(self.pi_bert)  # (n_cls, ctx_dim)
-        pi = pi.unsqueeze(1)  # (n_cls, 1, ctx_dim)
+        ctx = ctx.unsqueeze(0).unsqueeze(0).expand(-1, self.n_cls, -1, -1) # (1, n_cls, n_ctx, ctx_dim)
+        vpi = self.vi_meta_net(im_features) # (batch, ctx_dim) <- im_features batch size가 붙음.
+        vpi = vpi.unsqueeze(1).unsqueeze(1)    # (batch, 1,  1, ctx_dim)
+        lpi = self.li_meta_net(self.lpi_bert)  # (n_cls, ctx_dim)
+        lpi = lpi.unsqueeze(1).unsqueeze(0)  # (1, n_cls, 1, ctx_dim)
+
+        # GATE method for replace ansemble.
+        concat_pi = torch.cat([vpi.expand(-1, self.n_cls, -1, -1), lpi.expand(vpi.size(0), -1, -1, -1)], dim=-1) # (batch, n_cls,  1, ctx_dim)
+        z = torch.sigmoid(self.gate_layer(concat_pi))
+        ctx_shifted = ctx + (z * vpi + (1 - z) * lpi)
 
         # if self.class_token_position == "on_ctx":
-        ctx_shifted = ctx + pi # (n_cls, n_ctx, ctx_dim) 브로드캐스팅 됨.
+        ctx_shifted = ctx + vpi # (batch, n_cls, n_ctx, ctx_dim) 브로드캐스팅 됨.
+        ctx_shifted = ctx_shifted + lpi # (batch, n_cls, n_ctx, ctx_dim) 브로드캐스팅 됨.
 
         # elif self.class_token_position == "off_ctx": # a photo of a apple pie is pi-token.
             # ctx_shifted = torch.cat([ctx, pi], dim=1)
 
-        prompts = torch.cat(
-            [
-                self.token_prefix,  # (n_cls, 1, ctx_dim)
-                ctx_shifted,        # (n_cls, n_ctx, ctx_dim) # or (n_cls, n_ctx + 1, ctx_dim)
-                self.token_suffix   # (n_cls, *, ctx_dim)
-            ],
-            dim=1
-        ).type(self.dtype)
+        prompts = []
+        for ctx_shifted_i in ctx_shifted:
+            prompts_i = self.construct_prompts(
+                ctx_shifted_i, self.token_prefix, self.token_suffix
+                ) # (n_cls, n_ctx, ctx_dim)
+            prompts.append(prompts_i)
+        prompts = torch.stack(prompts)
 
-        return prompts
+        return prompts # (batch, n_cls, n_ctx, ctx_dim)
     
 
 class CustomCLIP(nn.Module):
@@ -201,18 +239,24 @@ class CustomCLIP(nn.Module):
         image_features = self.image_encoder(image.type(self.dtype))
         image_features = image_features / image_features.norm(dim=-1, keepdim=True)
 
-        prompts = self.prompt_learner()
+        prompts = self.prompt_learner(image_features) # (batch, n_cls, n_ctx, ctx_dim)
 
-        text_features = self.text_encoder(prompts, tokenized_prompts)
-        text_features = text_features / text_features.norm(dim=-1, keepdim=True)
-        logits = logit_scale * image_features @ text_features.t()
-        if self.prompt_learner.training and label is not None:
+        logits = []
+        for pts_i, imf_i in zip(prompts, image_features):
+            text_features = self.text_encoder(pts_i, tokenized_prompts)
+            text_features = text_features / text_features.norm(dim=-1, keepdim=True)
+            l_i = logit_scale * imf_i @ text_features.t()
+            logits.append(l_i)
+        logits = torch.stack(logits)
+
+        if self.prompt_learner.training:
             return F.cross_entropy(logits, label)
+        
         return logits
     
     
 @TRAINER_REGISTRY.register()
-class LiCoCoOp(TrainerX):
+class DuCoCoOp(TrainerX):
     def build_model(self):
         cfg = self.cfg
         classnames = self.dm.dataset.classnames
@@ -222,7 +266,7 @@ class LiCoCoOp(TrainerX):
         print(f"Loading CLIP (backbone: {cfg.MODEL.BACKBONE.NAME})")
         clip_model = load_clip_to_cpu(cfg)
 
-        if cfg.TRAINER.LICOCOOP.PREC == "fp32" or cfg.TRAINER.LICOCOOP.PREC == "amp":
+        if cfg.TRAINER.DUCOCOOP.PREC == "fp32" or cfg.TRAINER.DUCOCOOP.PREC == "amp":
             clip_model.float()
 
         print("Building PiToken-based custom CLIP")
@@ -246,7 +290,7 @@ class LiCoCoOp(TrainerX):
         self.sched = build_lr_scheduler(self.optim, cfg.OPTIM)
         self.register_model("prompt_learner", self.model.prompt_learner, self.optim, self.sched)
 
-        self.scaler = GradScaler() if cfg.TRAINER.LICOCOOP.PREC == "amp" else None
+        self.scaler = GradScaler() if cfg.TRAINER.DUCOCOOP.PREC == "amp" else None
 
         # Note that multi-gpu training could be slow because CLIP's size is
         # big, which slows down the copy operation in DataParallel
@@ -261,14 +305,14 @@ class LiCoCoOp(TrainerX):
         pl = self.model.prompt_learner
         device = self.device
 
-        # 1) BERT&meta_net2를 올리고 eval 모드
+        # 1) BERT&li_meta_net를 올리고 eval 모드
         pl.caption_gen.to(device).eval()
-        pl.meta_net2.to(device).eval()
+        pl.li_meta_net.to(device).eval()
 
         # 2) 한 번만 캡션 벡터 → bias 계산
         with torch.no_grad():
-            pi_bert = pl.caption_gen(pl.captions)   # (n_cls, bert_dim)
-        pl.pi_bert = pi_bert.half()
+            lpi_bert = pl.caption_gen(pl.captions)   # (n_cls, bert_dim)
+        pl.lpi_bert = lpi_bert.half()
 
     def forward_backward(self, batch):
         """
@@ -280,7 +324,7 @@ class LiCoCoOp(TrainerX):
         optim = self.optim
         scaler = self.scaler
         
-        prec = self.cfg.TRAINER.LICOCOOP.PREC
+        prec = self.cfg.TRAINER.DUCOCOOP.PREC
         if prec == "amp":
             with autocast():
                 loss = model(image, label)

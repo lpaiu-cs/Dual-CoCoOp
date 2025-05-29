@@ -92,94 +92,118 @@ class CaptionVecGen(nn.Module):
 
 class PromptLearner(nn.Module):
     """
-    Replace meta-net with BERT-based class descriptor tokens.
+    CoCoOp + pi_token off-context 구조. 
+    고정 프롬프트: 'a photo of a {class} is {pi_token}.'
+    - 'a photo of a', 'is', '.'은 고정 (token embedding만 사용, 학습 X)
+    - pi_token만 학습 (nn.Parameter)
     """
     def __init__(self, cfg, classnames, captions, clip_model, device='cpu'):
         super().__init__()
         self.device = device
         self.n_cls = len(classnames)
-        self.n_ctx = cfg.TRAINER.LICOCOOP.N_CTX
-        ctx_init = cfg.TRAINER.LICOCOOP.CTX_INIT
+        self.ctx_dim = clip_model.ln_final.weight.shape[0]
         self.dtype = clip_model.dtype
         ctx_dim = clip_model.ln_final.weight.shape[0]
-        # vis_dim = clip_model.visual.output_dim
 
+        # meta_net3: (BERT 클래스 설명 → pi_token)
         self.captions = captions
         self.caption_gen = CaptionVecGen(device)
-        bert_dim = self.caption_gen.bert.config.hidden_size # bert_dim: (768,) 동적으로 가져오기.
-        self.pi_bert = None  # (n_cls, bert_dim)
+        bert_dim = self.caption_gen.bert.config.hidden_size
+        self.bert_emb = None
 
         clip_imsize = clip_model.visual.input_resolution
         cfg_imsize = cfg.INPUT.SIZE[0]
         assert cfg_imsize == clip_imsize, f"cfg_imsize ({cfg_imsize}) must equal to clip_imsize ({clip_imsize})"
 
-        # 프롬프트 초기화 방식
-        if ctx_init:
-            # sys.exit("ctx_init 아직 테스트 안함. config에서 비워두세요.")
-            ctx_init = ctx_init.replace("_", " ")  # 언더바를 공백으로 변환
-            n_ctx = len(ctx_init.split(" ")) # ctx_init의 단어 개수
-            prompt = clip.tokenize(ctx_init)
-            with torch.no_grad():
-                embedding = clip_model.token_embedding(prompt).type(self.dtype)
-            ctx_vectors = embedding[0, 1 : 1 + n_ctx, :]
-            prompt_prefix = ctx_init
-        else:
-            ctx_vectors = torch.empty(self.n_ctx, ctx_dim, dtype=self.dtype)
-            nn.init.normal_(ctx_vectors, std=0.02)
-            prompt_prefix = " ".join(["X"] * self.n_ctx)
+        self.n_ctx = 1  # pi_token 한 개
+        # self.ctx = nn.Parameter(torch.empty(self.n_ctx, self.ctx_dim, dtype=self.dtype))
+        # nn.init.normal_(self.ctx, std=0.02)
 
-        self.ctx = nn.Parameter(ctx_vectors)
 
-        # meta_net2: (bert_dim → ctx_dim) 변환기
-        self.meta_net2 = nn.Sequential(OrderedDict([
-            ("linear1", nn.Linear(bert_dim, ctx_dim // 16)),
+        self.meta_net3 = nn.Sequential(OrderedDict([
+            ("linear1", nn.Linear(bert_dim, self.ctx_dim // 16)),
             ("relu", nn.ReLU(inplace=True)),
-            ("linear2", nn.Linear(ctx_dim // 16, ctx_dim))
+            ("linear2", nn.Linear(self.ctx_dim // 16, self.ctx_dim))
         ]))
-
-        if cfg.TRAINER.LICOCOOP.PREC == "fp16":
-            # self.caption_gen.half()
-            self.meta_net2.half()
-
+        if cfg.TRAINER.LICOCOOP2.PREC == "fp16":
+            self.meta_net3.half()
+        
         classnames = [name.replace("_", " ") for name in classnames]
         name_lens = [len(_tokenizer.encode(name)) for name in classnames]
-        prompts = [prompt_prefix + " " + name + "." for name in classnames]
 
-        tokenized_prompts = torch.cat([clip.tokenize(p) for p in prompts])  # (n_cls, n_tkn)
+        # 고정 프롬프트: 'a photo of a {class} is {pi_token}.'
+        ctx = "a photo of a"
+        be = "is"   
+
+        # 토큰화: 각 class에 대해 ['a photo of a', {class}, 'is', 'X']
+        prompts = [f"{ctx} {cname} {be} X" for cname in classnames] # (n_cls, <77)
+        tokenized_prompts = torch.cat([clip.tokenize(string) for string in prompts]) # (n_cls, <77)
         with torch.no_grad():
-            embedding = clip_model.token_embedding(tokenized_prompts).type(self.dtype)
+            embeddings = clip_model.token_embedding(tokenized_prompts).type(self.dtype) # (n_cls, <77, bert_dim)
 
-        token_prefix = embedding[:, :1, :].type(self.dtype) # SOS
-        token_suffix = embedding[:, 1 + self.n_ctx:, :].type(self.dtype) # n_ctx 만큼 비워둬야함.
-        self.register_buffer("token_prefix", token_prefix) 
-        self.register_buffer("token_suffix", token_suffix)
+        # 고정 prefix/suffix, class 토큰 idx 파악
+        # token_prefix: 'a photo of a {class} is'까지
+        # token_pi_idx: 'X' 위치 (pi_token 위치)
+        # token_suffix: '.' 이후 토큰
+        # (실제 위치는 tokenizer를 통해 확인, 아래는 예시)
+        # e.g. for prompt = [SOS, a, photo, of, a, class, is, X, ., EOS]
+        #      pi_token은 7번째 토큰 위치(0-based)
+
+        # X 토큰 ID 가져오기
+        x_token_id = clip.tokenize("X").squeeze()[1].item() # [SOS, X, 0, 0...] 
+
+        # 각 클래스별로 X 토큰의 실제 위치 찾기
+        pi_token_idx = [] # (n_cls, )
+        for i in range(self.n_cls):
+            idx = (tokenized_prompts[i] == x_token_id).nonzero(as_tuple=False)
+            if len(idx) == 0:
+                raise ValueError(f"Token 'X' not found in prompt {i} ({prompts[i]})")
+            pi_token_idx.append(idx[-1].item())
+
+        # prefix, suffix 각각 클래스별로 저장
+        max_len = tokenized_prompts.shape[1]
+        prefix_list = []
+        suffix_list = []
+        for i in range(self.n_cls):
+            prefix = embeddings[i, :pi_token_idx[i], :]  # (prefix_len, dim)
+            suffix = embeddings[i, pi_token_idx[i] + 1:max_len, :]  # (suffix_len, dim)
+            prefix_list.append(prefix)
+            suffix_list.append(suffix)
+
+        # 패딩을 맞춰야 함 (prompt 길이 달라질 수 있음)
+        # => prefix, suffix를 (n_cls, max_prefix_len, dim), (n_cls, max_suffix_len, dim)로 맞춘다
+        max_prefix_len = max([p.shape[0] for p in prefix_list])
+        min_suffix_len = min([s.shape[0] for s in suffix_list])
+
+        print(f"max_prefix_len: {max_prefix_len}, min_suffix_len: {min_suffix_len}")
+        assert max_prefix_len + min_suffix_len == 76, f"max_prefix_len + min_suffix_len must equal to 76"
+
+        for i in range(self.n_cls):
+            # prefix
+            pad = (0, 0, 0, max_prefix_len - prefix_list[i].shape[0])
+            prefix_list[i] = F.pad(prefix_list[i], pad)
+            # suffix
+            suffix_list[i] = suffix_list[i][:min_suffix_len, :]  # (suffix_len, dim)
+
+        self.register_buffer("token_prefix", torch.stack(prefix_list, dim=0)) # (n_cls, max_prefix_len, dim)
+        self.register_buffer("token_suffix", torch.stack(suffix_list, dim=0)) # (n_cls, max_suffix_len, dim)
 
         self.tokenized_prompts = tokenized_prompts
-        self.name_lens = name_lens
-        # self.class_token_position = cfg.TRAINER.LICOCOOP.PI_TOKEN_POSITION # 'on_ctx', 'off_ctx'
+        # self.name_lens = name_lens  # 각 클래스 이름의 토큰 길이
 
-    def forward(self): # cap_vectors: (n_cls, bert_dim)
-        assert self.pi_bert is not None, "BERT embeddings must be generated before calling forward()"
-        ctx = self.ctx # (n_ctx, ctx_dim)
-        ctx = ctx.unsqueeze(0).expand(self.n_cls, -1, -1) # (n_cls, n_ctx, ctx_dim)
-        pi = self.meta_net2(self.pi_bert)  # (n_cls, ctx_dim)
-        pi = pi.unsqueeze(1)  # (n_cls, 1, ctx_dim)
-
-        # if self.class_token_position == "on_ctx":
-        ctx_shifted = ctx + pi # (n_cls, n_ctx, ctx_dim) 브로드캐스팅 됨.
-
-        # elif self.class_token_position == "off_ctx": # a photo of a apple pie is pi-token.
-            # ctx_shifted = torch.cat([ctx, pi], dim=1)
-
+    def forward(self):
+        assert self.bert_emb is not None
+        pi = self.meta_net3(self.bert_emb).unsqueeze(1)  # (n_cls, 1, ctx_dim)
+        # self._last_pi = pi # for debugging
+        # ctx 파라미터를 사용하지 않고, pi만 사용
         prompts = torch.cat(
             [
-                self.token_prefix,  # (n_cls, 1, ctx_dim)
-                ctx_shifted,        # (n_cls, n_ctx, ctx_dim) # or (n_cls, n_ctx + 1, ctx_dim)
-                self.token_suffix   # (n_cls, *, ctx_dim)
+                self.token_prefix,     # (n_cls, prefix_len, ctx_dim)
+                pi,                   # (n_cls, 1, ctx_dim) - pi_token
+                self.token_suffix     # (n_cls, suffix_len, ctx_dim)
             ],
             dim=1
         ).type(self.dtype)
-
         return prompts
     
 
@@ -212,7 +236,7 @@ class CustomCLIP(nn.Module):
     
     
 @TRAINER_REGISTRY.register()
-class LiCoCoOp(TrainerX):
+class LiCoCoOp2(TrainerX):
     def build_model(self):
         cfg = self.cfg
         classnames = self.dm.dataset.classnames
@@ -222,7 +246,7 @@ class LiCoCoOp(TrainerX):
         print(f"Loading CLIP (backbone: {cfg.MODEL.BACKBONE.NAME})")
         clip_model = load_clip_to_cpu(cfg)
 
-        if cfg.TRAINER.LICOCOOP.PREC == "fp32" or cfg.TRAINER.LICOCOOP.PREC == "amp":
+        if cfg.TRAINER.LICOCOOP2.PREC == "fp32" or cfg.TRAINER.LICOCOOP2.PREC == "amp":
             clip_model.float()
 
         print("Building PiToken-based custom CLIP")
@@ -246,7 +270,7 @@ class LiCoCoOp(TrainerX):
         self.sched = build_lr_scheduler(self.optim, cfg.OPTIM)
         self.register_model("prompt_learner", self.model.prompt_learner, self.optim, self.sched)
 
-        self.scaler = GradScaler() if cfg.TRAINER.LICOCOOP.PREC == "amp" else None
+        self.scaler = GradScaler() if cfg.TRAINER.LICOCOOP2.PREC == "amp" else None
 
         # Note that multi-gpu training could be slow because CLIP's size is
         # big, which slows down the copy operation in DataParallel
@@ -261,14 +285,14 @@ class LiCoCoOp(TrainerX):
         pl = self.model.prompt_learner
         device = self.device
 
-        # 1) BERT&meta_net2를 올리고 eval 모드
+        # 1) BERT&meta_net3를 올리고 eval 모드
         pl.caption_gen.to(device).eval()
-        pl.meta_net2.to(device).eval()
+        pl.meta_net3.to(device).eval()
 
         # 2) 한 번만 캡션 벡터 → bias 계산
         with torch.no_grad():
-            pi_bert = pl.caption_gen(pl.captions)   # (n_cls, bert_dim)
-        pl.pi_bert = pi_bert.half()
+            bert_emb = pl.caption_gen(pl.captions)   # (n_cls, bert_dim)
+        pl.bert_emb = bert_emb.half()
 
     def forward_backward(self, batch):
         """
@@ -280,7 +304,7 @@ class LiCoCoOp(TrainerX):
         optim = self.optim
         scaler = self.scaler
         
-        prec = self.cfg.TRAINER.LICOCOOP.PREC
+        prec = self.cfg.TRAINER.LICOCOOP2.PREC
         if prec == "amp":
             with autocast():
                 loss = model(image, label)
@@ -290,6 +314,13 @@ class LiCoCoOp(TrainerX):
             scaler.update()
         else:
             loss = model(image, label) # forward
+
+            # DEBUG
+            # pi = self.model.prompt_learner._last_pi  # (n_cls, 1, ctx_dim)
+            # pi_l2_loss = pi.pow(2).mean()  # 전체 평균
+            # total_loss = loss + (1e-2) * pi_l2_loss  # lambda=1e-2는 조절 가능
+
+
             optim.zero_grad()
             loss.backward()
             optim.step()
@@ -341,3 +372,4 @@ class LiCoCoOp(TrainerX):
             print("Loading weights to {} " 'from "{}" (epoch = {})'.format(name, model_path, epoch))
             # set strict=False
             self._models[name].load_state_dict(state_dict, strict=False)
+
