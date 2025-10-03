@@ -1,6 +1,8 @@
 # Dual-CoCoOp
 고려대학교 COSE-461 25-1 자연어처리 Final Project의 논문 코드입니다.
 
+This is the paper code for the final project paper of COSE-461 Natural Language Processing (Spring 2025), Korea University.
+
 --------
 # Paper
 
