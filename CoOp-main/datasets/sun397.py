@@ -1,44 +1,38 @@
 import os
 import pickle
-import json
 
 from dassl.data.datasets import DATASET_REGISTRY, Datum, DatasetBase
 from dassl.utils import mkdir_if_missing
 
 from .oxford_pets import OxfordPets
-from .dtd import DescribableTextures as DTD
-
-NEW_CNAMES = {
-    "AnnualCrop": "Annual Crop Land",
-    "Forest": "Forest",
-    "HerbaceousVegetation": "Herbaceous Vegetation Land",
-    "Highway": "Highway or Road",
-    "Industrial": "Industrial Buildings",
-    "Pasture": "Pasture Land",
-    "PermanentCrop": "Permanent Crop Land",
-    "Residential": "Residential Buildings",
-    "River": "River",
-    "SeaLake": "Sea or Lake",
-}
 
 
 @DATASET_REGISTRY.register()
-class EuroSAT(DatasetBase):
+class SUN397(DatasetBase):
 
-    dataset_dir = "eurosat"
+    dataset_dir = "sun397"
 
     def __init__(self, cfg):
         root = os.path.abspath(os.path.expanduser(cfg.DATASET.ROOT))
         self.dataset_dir = os.path.join(root, self.dataset_dir)
-        self.image_dir = os.path.join(self.dataset_dir, "2750")
-        self.split_path = os.path.join(self.dataset_dir, "split_zhou_EuroSAT.json")
+        self.image_dir = os.path.join(self.dataset_dir, "SUN397")
+        self.split_path = os.path.join(self.dataset_dir, "split_zhou_SUN397.json")
         self.split_fewshot_dir = os.path.join(self.dataset_dir, "split_fewshot")
         mkdir_if_missing(self.split_fewshot_dir)
 
         if os.path.exists(self.split_path):
             train, val, test = OxfordPets.read_split(self.split_path, self.image_dir)
         else:
-            train, val, test = DTD.read_and_split_data(self.image_dir, new_cnames=NEW_CNAMES)
+            classnames = []
+            with open(os.path.join(self.dataset_dir, "ClassName.txt"), "r") as f:
+                lines = f.readlines()
+                for line in lines:
+                    line = line.strip()[1:]  # remove /
+                    classnames.append(line)
+            cname2lab = {c: i for i, c in enumerate(classnames)}
+            trainval = self.read_data(cname2lab, "Training_01.txt")
+            test = self.read_data(cname2lab, "Testing_01.txt")
+            train, val = OxfordPets.split_trainval(trainval)
             OxfordPets.save_split(train, val, test, self.split_path, self.image_dir)
 
         num_shots = cfg.DATASET.NUM_SHOTS
@@ -62,28 +56,25 @@ class EuroSAT(DatasetBase):
         subsample = cfg.DATASET.SUBSAMPLE_CLASSES
         train, val, test = OxfordPets.subsample_classes(train, val, test, subsample=subsample)
 
-        self.captions = None
-        captions_path = os.path.join(self.dataset_dir, "eurosat_captions.json")
-        if os.path.exists(captions_path):
-            with open(captions_path, "r") as f:
-                captions_dict = json.load(f)
-            active_classnames = []
-            seen_labels = set()
-            for item in train:
-                if item.label in seen_labels:
-                    continue
-                seen_labels.add(item.label)
-                active_classnames.append((item.label, item.classname))
-            active_classnames = [classname for _, classname in sorted(active_classnames)]
-            self.captions = [captions_dict[cname] for cname in active_classnames]
-
         super().__init__(train_x=train, val=val, test=test)
 
-    def update_classname(self, dataset_old):
-        dataset_new = []
-        for item_old in dataset_old:
-            cname_old = item_old.classname
-            cname_new = NEW_CLASSNAMES[cname_old]
-            item_new = Datum(impath=item_old.impath, label=item_old.label, classname=cname_new)
-            dataset_new.append(item_new)
-        return dataset_new
+    def read_data(self, cname2lab, text_file):
+        text_file = os.path.join(self.dataset_dir, text_file)
+        items = []
+
+        with open(text_file, "r") as f:
+            lines = f.readlines()
+            for line in lines:
+                imname = line.strip()[1:]  # remove /
+                classname = os.path.dirname(imname)
+                label = cname2lab[classname]
+                impath = os.path.join(self.image_dir, imname)
+
+                names = classname.split("/")[1:]  # remove 1st letter
+                names = names[::-1]  # put words like indoor/outdoor at first
+                classname = " ".join(names)
+
+                item = Datum(impath=impath, label=label, classname=classname)
+                items.append(item)
+
+        return items

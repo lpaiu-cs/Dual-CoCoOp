@@ -60,14 +60,20 @@ class UCF101(DatasetBase):
         subsample = cfg.DATASET.SUBSAMPLE_CLASSES
         train, val, test = OxfordPets.subsample_classes(train, val, test, subsample=subsample)
 
-        # 클래스 이름 로드
-        with open(os.path.join(self.dataset_dir, "classes.txt"), "r") as f:
-            classnames = [line.strip() for line in f if line.strip()]
-        # 캡션 로드
+        self.captions = None
         captions_path = os.path.join(self.dataset_dir, "ucf101_captions.json")
-        with open(captions_path, "r") as f:
-            captions_dict = json.load(f)
-        self.captions = [captions_dict[cname] for cname in classnames]
+        if os.path.exists(captions_path):
+            with open(captions_path, "r") as f:
+                captions_dict = json.load(f)
+            active_classnames = []
+            seen_labels = set()
+            for item in train:
+                if item.label in seen_labels:
+                    continue
+                seen_labels.add(item.label)
+                active_classnames.append((item.label, item.classname))
+            active_classnames = [classname for _, classname in sorted(active_classnames)]
+            self.captions = [captions_dict[cname] for cname in active_classnames]
 
         super().__init__(train_x=train, val=val, test=test)
 

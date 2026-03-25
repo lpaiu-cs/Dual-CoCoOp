@@ -213,6 +213,23 @@ class CustomCLIP(nn.Module):
     
 @TRAINER_REGISTRY.register()
 class LiCoCoOp(TrainerX):
+    def _prepare_caption_embeddings(self):
+        pl = self.model.prompt_learner
+
+        if pl.captions is None:
+            raise ValueError(
+                "LiCoCoOp requires dataset captions, but no caption JSON was found "
+                "for the active dataset split."
+            )
+
+        if pl.pi_bert is not None:
+            return
+
+        pl.caption_gen.to(self.device).eval()
+
+        with torch.no_grad():
+            pl.pi_bert = pl.caption_gen(pl.captions).to(device=self.device, dtype=pl.ctx.dtype)
+
     def build_model(self):
         cfg = self.cfg
         classnames = self.dm.dataset.classnames
@@ -234,6 +251,8 @@ class LiCoCoOp(TrainerX):
         for name, param in self.model.named_parameters():
             if name_to_update not in name:
                 param.requires_grad_(False)
+        for param in self.model.prompt_learner.caption_gen.parameters():
+            param.requires_grad_(False)
         enabled = [name for name, param in self.model.named_parameters() if param.requires_grad]
         print(f"Parameters to be updated: {enabled}")
 
@@ -241,6 +260,7 @@ class LiCoCoOp(TrainerX):
             load_pretrained_weights(self.model.prompt_learner, cfg.MODEL.INIT_WEIGHTS)
 
         self.model.to(self.device)
+        self._prepare_caption_embeddings()
         # NOTE: only give prompt_learner to the optimizer
         self.optim = build_optimizer(self.model.prompt_learner, cfg.OPTIM)
         self.sched = build_lr_scheduler(self.optim, cfg.OPTIM)
@@ -257,18 +277,7 @@ class LiCoCoOp(TrainerX):
 
     def before_train(self):
         super().before_train()
-
-        pl = self.model.prompt_learner
-        device = self.device
-
-        # 1) BERT&meta_net2를 올리고 eval 모드
-        pl.caption_gen.to(device).eval()
-        pl.meta_net2.to(device).eval()
-
-        # 2) 한 번만 캡션 벡터 → bias 계산
-        with torch.no_grad():
-            pi_bert = pl.caption_gen(pl.captions)   # (n_cls, bert_dim)
-        pl.pi_bert = pi_bert.half()
+        self._prepare_caption_embeddings()
 
     def forward_backward(self, batch):
         """

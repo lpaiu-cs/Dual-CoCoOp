@@ -144,12 +144,13 @@ class PromptLearner(nn.Module):
             ("linear2", nn.Linear(ctx_dim // 16, ctx_dim))
         ]))
         
-        self. gate_layer = nn.Linear(ctx_dim * 2, ctx_dim).half()
+        self.gate_layer = nn.Linear(ctx_dim * 2, ctx_dim)
 
         if cfg.TRAINER.DUCOCOOP.PREC == "fp16":
             # self.caption_gen.half()
             self.vi_meta_net.half()
             self.li_meta_net.half()
+            self.gate_layer.half()
 
         classnames = [name.replace("_", " ") for name in classnames]
         name_lens = [len(_tokenizer.encode(name)) for name in classnames]
@@ -198,14 +199,12 @@ class PromptLearner(nn.Module):
         lpi = self.li_meta_net(self.lpi_bert)  # (n_cls, ctx_dim)
         lpi = lpi.unsqueeze(1).unsqueeze(0)  # (1, n_cls, 1, ctx_dim)
 
-        # GATE method for replace ansemble.
-        concat_pi = torch.cat([vpi.expand(-1, self.n_cls, -1, -1), lpi.expand(vpi.size(0), -1, -1, -1)], dim=-1) # (batch, n_cls,  1, ctx_dim)
+        concat_pi = torch.cat(
+            [vpi.expand(-1, self.n_cls, -1, -1), lpi.expand(vpi.size(0), -1, -1, -1)],
+            dim=-1,
+        )
         z = torch.sigmoid(self.gate_layer(concat_pi))
         ctx_shifted = ctx + (z * vpi + (1 - z) * lpi)
-
-        # if self.class_token_position == "on_ctx":
-        ctx_shifted = ctx + vpi # (batch, n_cls, n_ctx, ctx_dim) 브로드캐스팅 됨.
-        ctx_shifted = ctx_shifted + lpi # (batch, n_cls, n_ctx, ctx_dim) 브로드캐스팅 됨.
 
         # elif self.class_token_position == "off_ctx": # a photo of a apple pie is pi-token.
             # ctx_shifted = torch.cat([ctx, pi], dim=1)
@@ -257,6 +256,23 @@ class CustomCLIP(nn.Module):
     
 @TRAINER_REGISTRY.register()
 class DuCoCoOp(TrainerX):
+    def _prepare_caption_embeddings(self):
+        pl = self.model.prompt_learner
+
+        if pl.captions is None:
+            raise ValueError(
+                "DuCoCoOp requires dataset captions, but no caption JSON was found "
+                "for the active dataset split."
+            )
+
+        if pl.lpi_bert is not None:
+            return
+
+        pl.caption_gen.to(self.device).eval()
+
+        with torch.no_grad():
+            pl.lpi_bert = pl.caption_gen(pl.captions).to(device=self.device, dtype=pl.ctx.dtype)
+
     def build_model(self):
         cfg = self.cfg
         classnames = self.dm.dataset.classnames
@@ -278,6 +294,8 @@ class DuCoCoOp(TrainerX):
         for name, param in self.model.named_parameters():
             if name_to_update not in name:
                 param.requires_grad_(False)
+        for param in self.model.prompt_learner.caption_gen.parameters():
+            param.requires_grad_(False)
         enabled = [name for name, param in self.model.named_parameters() if param.requires_grad]
         print(f"Parameters to be updated: {enabled}")
 
@@ -285,6 +303,7 @@ class DuCoCoOp(TrainerX):
             load_pretrained_weights(self.model.prompt_learner, cfg.MODEL.INIT_WEIGHTS)
 
         self.model.to(self.device)
+        self._prepare_caption_embeddings()
         # NOTE: only give prompt_learner to the optimizer
         self.optim = build_optimizer(self.model.prompt_learner, cfg.OPTIM)
         self.sched = build_lr_scheduler(self.optim, cfg.OPTIM)
@@ -301,18 +320,7 @@ class DuCoCoOp(TrainerX):
 
     def before_train(self):
         super().before_train()
-
-        pl = self.model.prompt_learner
-        device = self.device
-
-        # 1) BERT&li_meta_net를 올리고 eval 모드
-        pl.caption_gen.to(device).eval()
-        pl.li_meta_net.to(device).eval()
-
-        # 2) 한 번만 캡션 벡터 → bias 계산
-        with torch.no_grad():
-            lpi_bert = pl.caption_gen(pl.captions)   # (n_cls, bert_dim)
-        pl.lpi_bert = lpi_bert.half()
+        self._prepare_caption_embeddings()
 
     def forward_backward(self, batch):
         """
