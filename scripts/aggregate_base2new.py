@@ -43,6 +43,16 @@ def main():
             / f"seed{seed}"
             / "log.txt"
         )
+        base_eval_log = (
+            args.output_root
+            / "test_base"
+            / args.dataset
+            / "shots_16"
+            / args.trainer
+            / args.config
+            / f"seed{seed}"
+            / "log.txt"
+        )
         test_log = (
             args.output_root
             / "test_new"
@@ -53,7 +63,12 @@ def main():
             / f"seed{seed}"
             / "log.txt"
         )
-        base = read_accuracy(train_log)
+        try:
+            base = read_accuracy(train_log)
+        except ValueError:
+            if not base_eval_log.exists():
+                raise
+            base = read_accuracy(base_eval_log)
         new = read_accuracy(test_log)
         rows.append({"seed": seed, "base": base, "new": new, "harmonic": harmonic_mean(base, new)})
 

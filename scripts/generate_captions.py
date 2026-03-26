@@ -7,6 +7,23 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 
 PROMPTS = {
+    "dtd": {
+        "examples": {
+            "bubbly": "surface covered with small, round protrusions resembling foam or air-filled blisters, giving a light and uneven texture.",
+            "frilly": "surface featuring delicate, ruffled edges or layered folds with a soft, fluttering, fabric-like texture.",
+            "woven": "interlaced strands or fibers forming a tight, grid-like pattern with a coarse yet structured tactile feel.",
+            "crystalline": "surface composed of angular, faceted structures with sharp edges and a rigid, glass-like tactile sensation.",
+            "paisley": "surface decorated with intricate, teardrop-shaped motifs arranged in flowing, curved patterns.",
+            "polka-dotted": "surface marked with evenly spaced round spots that interrupt a flat background and create a punctuated visual rhythm.",
+        },
+        "instruction": (
+            "You are a chatbot that receives a label from the DTD (Describable Textures Dataset) "
+            'and generates a description to replace the fixed prompt "a photo of" in the CLIP '
+            "model's text encoder. Focus on texture, material structure, repeated surface patterns, "
+            "and tactile sensation. Avoid generic filler, subjective language, or abstract emotional "
+            "phrasing. Return one visually grounded sentence only."
+        ),
+    },
     "eurosat": {
         "examples": {
             "Forest": "dense clusters of tree canopies forming irregular green patches with minimal built structures.",
@@ -43,10 +60,48 @@ PROMPTS = {
             "should only be included if visually identifying."
         ),
     },
+    "food101": {
+        "examples": {
+            "apple_pie": "lattice-topped round pie filled with visible apple slices and a golden-brown crust.",
+            "steak": "thick seared meat with a broad brown surface, visible grill marks, and a compact slab-like shape.",
+            "tacos": "folded or open tortillas filled with visible meat, lettuce, and chopped toppings.",
+            "red_velvet_cake": "layered round cake with deep red sponge and white cream or frosting between layers.",
+            "samosa": "triangular fried pastry with a crisp shell and filling visible near the edges.",
+        },
+        "instruction": (
+            "You are a chatbot that extracts concise, externally observable information about a food "
+            'label to replace the generic prompt "a photo of" in the CLIP model\'s text encoder. '
+            "Focus on visible shape, structure, plating, and prominent ingredients that can be seen "
+            "from an image. Avoid subjective quality words, smell, taste, or cultural background. "
+            "If a dish has a consistent visual color pattern, you may mention it briefly. Return one "
+            "sentence only."
+        ),
+    },
+    "ucf101": {
+        "examples": {
+            "Tai_Chi": "martial arts movements performed with extended arms and controlled posture in an open or park-like setting.",
+            "Trampoline_Jumping": "repetitive vertical leaps performed on a trampoline with extended limbs and airborne motion against a static background.",
+            "Biking": "pedaling motion on a bicycle with forward body lean, typically along roads, trails, or open paths.",
+            "Breast_Stroke": "swimming action with synchronized arm sweeps and frog-like leg kicks performed horizontally in a pool.",
+            "Band_Marching": "synchronized walking in formation while carrying musical instruments, often on open fields or parade grounds.",
+            "Apply_Eye_Makeup": "precise hand movements near the eye area using brushes or applicators while facing a mirror.",
+        },
+        "instruction": (
+            "You are a chatbot that receives a label from the UCF101 dataset and generates a short, "
+            'informative description to replace the generic prompt "a photo of" in the CLIP model\'s '
+            "text encoder. Focus on the nature of the action, body movement, relevant objects, and "
+            "typical scene context. Avoid vague adjectives, stylistic language, or unnecessary detail. "
+            "Return one sentence only."
+        ),
+    },
 }
 
 
 def load_labels(dataset_root: Path, dataset: str) -> list[str]:
+    if dataset == "dtd":
+        split_path = dataset_root / "dtd" / "split_zhou_DescribableTextures.json"
+        return load_labels_from_split(split_path)
+
     if dataset == "eurosat":
         return [
             "Annual Crop Land",
@@ -65,24 +120,51 @@ def load_labels(dataset_root: Path, dataset: str) -> list[str]:
         variants_path = dataset_root / "fgvc-aircraft-2013b" / "data" / "variants.txt"
         return [line.strip() for line in variants_path.read_text(encoding="utf-8").splitlines() if line.strip()]
 
+    if dataset == "food101":
+        split_path = dataset_root / "food-101" / "split_zhou_Food101.json"
+        return load_labels_from_split(split_path)
+
+    if dataset == "ucf101":
+        split_path = dataset_root / "ucf101" / "split_zhou_UCF101.json"
+        return load_labels_from_split(split_path)
+
     raise ValueError(f"Unsupported dataset: {dataset}")
 
 
 def output_path(dataset_root: Path, dataset: str) -> Path:
+    if dataset == "dtd":
+        return dataset_root / "dtd" / "dtd_captions.json"
     if dataset == "eurosat":
         return dataset_root / "eurosat" / "eurosat_captions.json"
     if dataset == "fgvc_aircraft":
         return dataset_root / "fgvc-aircraft-2013b" / "data" / "fgvc_aircraft_captions.json"
+    if dataset == "food101":
+        return dataset_root / "food-101" / "food101_captions.json"
+    if dataset == "ucf101":
+        return dataset_root / "ucf101" / "ucf101_captions.json"
     raise ValueError(f"Unsupported dataset: {dataset}")
+
+
+def load_labels_from_split(split_path: Path) -> list[str]:
+    split_data = json.loads(split_path.read_text(encoding="utf-8"))
+    classnames = {}
+    for split_name in ("train", "val", "test"):
+        for _, label, classname in split_data[split_name]:
+            classnames[int(label)] = classname
+    return [classnames[idx] for idx in sorted(classnames)]
 
 
 def build_prompt(dataset: str, label: str) -> str:
     prompt_spec = PROMPTS[dataset]
-    examples = "\n".join(f"{k} -> {v}" for k, v in prompt_spec["examples"].items())
+    examples = "\n".join(
+        f"{display_label(dataset, key)} -> {value}" for key, value in prompt_spec["examples"].items()
+    )
+    readable_label = display_label(dataset, label)
     return (
         f"{prompt_spec['instruction']}\n\n"
         f"Few-shot examples:\n{examples}\n\n"
-        f"Generate a caption for {label}.\n"
+        "Use natural-language text with spaces, not underscores or code-style identifiers.\n\n"
+        f'Generate a caption for the class label "{label}" (read as "{readable_label}").\n'
         "Return only the caption."
     )
 
@@ -94,7 +176,14 @@ def clean_caption(text: str) -> str:
     caption = caption.strip('"').strip("'")
     if caption.endswith("</s>"):
         caption = caption[:-4].strip()
+    caption = " ".join(caption.replace("_", " ").split())
     return caption
+
+
+def display_label(dataset: str, label: str) -> str:
+    if dataset in {"food101", "ucf101"}:
+        return label.replace("_", " ")
+    return label
 
 
 def generate_caption(tokenizer, model, dataset: str, label: str) -> str:
